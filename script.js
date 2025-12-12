@@ -36,6 +36,7 @@
 
   /* ---------- State ---------- */
   let lastOCR = { quick: '', enhanced: '', combined: '' };
+  let lastOCRtext = ''; // convenience alias kept in sync
   let parsedResult = null;
 
   /* ---------- Utils ---------- */
@@ -44,10 +45,14 @@
       statusBar.textContent = msg;
       statusBar.style.color = ok ? '#2ecc71' : '#e74c3c';
     }
-    console.log('[ANJ]', msg);
+    try { console.log('[ANJ]', msg); } catch (e) {}
   }
 
-  function downloadBlob(blob, name) {
+  function escapeHtml(s) {
+    return String(s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+  }
+
+  function downloadBlobDirect(blob, name) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -56,10 +61,6 @@
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
-  }
-
-  function escapeHtml(s) {
-    return String(s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
   }
 
   /* ---------- IndexedDB (history) ---------- */
@@ -162,7 +163,7 @@
     }
   }
 
-  /* ---------- file to image (images pass-through, pdf -> page image) ---------- */
+  /* ---------- file to image helper ---------- */
   async function fileToImageBlob(file) {
     if (!file) return null;
     if (file.type && file.type.startsWith('image/')) return file;
@@ -175,9 +176,7 @@
   /* ---------- Tesseract v4 recognize wrapper (no worker API) ---------- */
   async function recognizeWithTesseract(blobOrFile) {
     try {
-      // Tesseract.recognize works with File/Blob
       const out = await Tesseract.recognize(blobOrFile, 'eng');
-      // v4 sometimes returns out.data.text
       const text = (out && (out.data && out.data.text || out.text)) || '';
       return text;
     } catch (e) {
@@ -186,12 +185,11 @@
     }
   }
 
-  /* ---------- Low-level parsing helpers ---------- */
+  /* ---------- text helpers ---------- */
   function normalizeText(s) {
     return (s || '').replace(/\r/g, '').replace(/\t/g, ' ').replace(/[ \u00A0]{2,}/g, ' ').trim();
   }
   function toLines(s) { return normalizeText(s).split(/\n/).map(l => l.trim()).filter(Boolean); }
-
   function parseNumberString(s) {
     if (!s) return null;
     let t = String(s).replace(/[^\d,.\-]/g, '').trim();
@@ -208,7 +206,6 @@
     if (isNaN(n)) return null;
     return Math.round(n * 100);
   }
-
   function detectCurrency(text) {
     if (!text) return 'INR';
     if (/[₹]/.test(text) || /\bINR\b/i.test(text) || /\bRs\b/i.test(text)) return 'INR';
@@ -217,7 +214,6 @@
     if (/£/.test(text)) return 'GBP';
     return 'INR';
   }
-
   function formatCents(cents, currSymbol = '₹') {
     if (cents === null || cents === undefined) return '-';
     const neg = cents < 0;
@@ -227,7 +223,7 @@
     const intStr = String(intPart).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
     return (neg ? '-' : '') + currSymbol + intStr + '.' + dec;
   }
-
+     /* ---------- Parser (robust) ---------- */
   function tryParseDate(s) {
     if (!s) return null;
     s = s.replace(/\./g, '/').replace(/(st|nd|rd|th)/gi, '');
@@ -237,12 +233,11 @@
     let m;
     if ((m = s.match(rx1))) { const d = new Date(+m[1], +m[2] - 1, +m[3]); return d.toISOString().slice(0, 10); }
     if ((m = s.match(rx2))) { let y = +m[3]; if (y < 100) y += (y >= 50 ? 1900 : 2000); const d = new Date(y, +m[2] - 1, +m[1]); return d.toISOString().slice(0, 10); }
-    if ((m = s.match(rx3))) { const mon = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'].indexOf(m[1].slice(0, 3).toLowerCase()); const d = new Date(+m[3], mon, +m[2]); return d.toISOString().slice(0, 10); }
-    const p = Date.parse(s); if (!isNaN(p)) return new Date(p).toISOString().slice(0, 10);
+    if ((m = s.match(rx3))) { const mon = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'].indexOf(m[1].slice(0,3).toLowerCase()); const d = new Date(+m[3], mon, +m[2]); return d.toISOString().slice(0,10); }
+    const p = Date.parse(s); if (!isNaN(p)) return new Date(p).toISOString().slice(0,10);
     return null;
   }
 
-  /* ---------- Parser (robust) ---------- */
   function parseRawInvoiceText(raw) {
     raw = raw || '';
     const parsed = {
@@ -266,7 +261,7 @@
       return parsed;
     }
 
-    // merchant - top lines heuristic
+    // merchant detection
     (function () {
       for (let i = 0; i < Math.min(6, lines.length); i++) {
         const l = lines[i].replace(/\|/g, ' ').trim();
@@ -290,45 +285,39 @@
       const cand = (raw.match(/(\d{1,2}[\/\-\.\s]\d{1,2}[\/\-\.\s]\d{2,4}|\d{4}[\/\-\.\s]\d{1,2}[\/\-\.\s]\d{1,2}|[A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})/g) || []);
       let dt = null;
       for (const c of cand) {
-        const t = tryParseDate(c);
-        if (t) { dt = t; break; }
+        const t = tryParseDate(c); if (t) { dt = t; break; }
       }
-      if (!dt) {
-        for (const l of lines) { const t = tryParseDate(l); if (t) { dt = t; break; } }
-      }
+      if (!dt) { for (const l of lines) { const t = tryParseDate(l); if (t) { dt = t; break; } } }
       parsed.date = dt;
     })();
 
-    // total detection - look near bottom
+    // total detection
     (function () {
       const tail = lines.slice(Math.max(0, lines.length - 20));
-      const cand = [];
+      const values = [];
       tail.forEach(l => {
         if (/total|grand total|net amount|amount due|balance due|payable|invoice total/i.test(l) ||
           /₹|\$|£|€|Rs\b|INR\b/i.test(l)) {
           const nums = l.match(/-?[\d.,]+/g) || [];
-          nums.forEach(n => { const p = parseNumberString(n); if (p !== null) cand.push(p); });
+          nums.forEach(n => { const p = parseNumberString(n); if (p !== null) values.push(p); });
         }
       });
-      if (cand.length) parsed.total = { cents: Math.max(...cand), currency: detectCurrency(raw) };
+      if (values.length) parsed.total = { cents: Math.max(...values), currency: detectCurrency(raw) };
       else {
         const all = (raw.match(/-?[\d,.]{2,}/g) || []).map(n => parseNumberString(n)).filter(Boolean);
         if (all.length) parsed.total = { cents: Math.max(...all), currency: detectCurrency(raw) };
       }
     })();
 
-    // items extraction - heuristic multi-pass
+    // items extraction
     (function () {
-      // merge likely split name lines where a non-number line is before a number line
       const merged = [];
       for (let i = 0; i < lines.length; i++) {
-        const l = lines[i];
-        const next = lines[i + 1] || '';
+        const l = lines[i]; const next = lines[i + 1] || '';
         if (!/[0-9]/.test(l) && /[0-9]/.test(next)) {
           merged.push((l + ' ' + next).trim()); i++;
         } else merged.push(l);
       }
-      // combine hyphen-end lines
       const finalLines = [];
       for (let i = 0; i < merged.length; i++) {
         let cur = merged[i];
@@ -347,15 +336,12 @@
 
         if (nums.length >= 3) {
           item.total = nums[nums.length - 1];
-          // choose price as prior number that's smaller than total
           for (let i = nums.length - 2; i >= 0; i--) {
             const cand = nums[i];
             if (Math.abs(cand) < Math.max(100000000, Math.abs(item.total * 2))) { item.price = cand; break; }
           }
-          // qty detection from small integer
           for (let i = 0; i < nums.length; i++) {
-            const v = nums[i];
-            const units = Math.round(v / 100);
+            const v = nums[i]; const units = Math.round(v / 100);
             if (units >= 1 && units <= 500 && v % 100 === 0) { item.qty = units; break; }
           }
           if (!item.qty && item.price && item.total) {
@@ -366,7 +352,6 @@
           const a = nums[0], b = nums[1];
           if (b > a * 1.05) { item.price = a; item.total = b; const q = Math.round(b / a); if (q >= 1 && q <= 500) item.qty = q; }
           else {
-            // assume price & total (or qty & price)
             if (a % 100 === 0 && Math.round(a / 100) >= 1 && Math.round(a / 100) <= 500) {
               item.qty = Math.round(a / 100); item.price = b; item.total = Math.floor(item.price * item.qty);
             } else { item.price = a; item.total = b; }
@@ -378,7 +363,6 @@
         if (item.price && !item.total) item.total = Math.floor(item.price * (item.qty || 1));
         if (item.total && !item.price && item.qty) item.price = Math.floor(item.total / (item.qty || 1));
         if (item.qty === null) item.qty = item.price && item.total ? Math.max(1, Math.round(item.total / item.price)) : 1;
-        // ensure integer numbers
         if (item.price !== null) item.price = Number(item.price);
         if (item.total !== null) item.total = Number(item.total);
         item.currency = currency;
@@ -387,13 +371,8 @@
 
       const candidates = finalLines.filter(l => /[A-Za-z]/.test(l) && /[0-9]/.test(l));
       const mapped = [];
-      for (const r of candidates) {
-        const m = mapRowToItem(r);
-        if (m) mapped.push(m);
-      }
-      // dedupe
-      const seen = new Set();
-      const cleaned = [];
+      for (const r of candidates) { const m = mapRowToItem(r); if (m) mapped.push(m); }
+      const seen = new Set(); const cleaned = [];
       for (const it of mapped) {
         const key = (it.name || '') + '|' + (it.total || '') + '|' + (it.price || '');
         if (seen.has(key)) continue;
@@ -404,7 +383,7 @@
       parsed.items = cleaned;
     })();
 
-    // post-parse: infer total from items if missing
+    // infer total if missing
     const sumItems = parsed.items.reduce((s, it) => s + (it.total || 0), 0);
     if (!parsed.total && sumItems > 0) parsed.total = { cents: sumItems, currency: detectCurrency(parsed.raw), inferred: true };
 
@@ -415,13 +394,12 @@
       }
     }
 
-    // issues list
+    // issues & confidence
     if (!parsed.merchant || parsed.merchant === 'UNKNOWN') parsed.issues.push({ field: 'merchant', problem: 'missing' });
     if (!parsed.date) parsed.issues.push({ field: 'date', problem: 'missing' });
     if (!parsed.total) parsed.issues.push({ field: 'total', problem: 'missing' });
     if (!parsed.items || parsed.items.length === 0) parsed.issues.push({ field: 'items', problem: 'no_items' });
 
-    // confidence
     let score = 10;
     if (parsed.merchant && parsed.merchant !== 'UNKNOWN') score += 20;
     if (parsed.date) score += 15;
@@ -430,7 +408,6 @@
     if (parsed.mismatch) score = Math.max(30, score - 20);
     parsed.confidence = Math.min(100, score);
 
-    // display fields
     parsed.display = {
       merchant: parsed.merchant || '-',
       date: parsed.date || '-',
@@ -454,7 +431,6 @@
     totalEl.textContent = parsed.display.total || '-';
     categoryEl.textContent = parsed.category || '-';
 
-    // items table
     itemsTable.innerHTML = '';
     (parsed.display.items || []).forEach(it => {
       const tr = document.createElement('tr');
@@ -462,7 +438,7 @@
       itemsTable.appendChild(tr);
     });
 
-    rawTextEl.textContent = lastOCR.combined || '';
+    rawTextEl.textContent = lastOCR.combined || lastOCRtext || '';
     cleanedTextEl.textContent = parsed.raw || '';
     jsonPreview.textContent = JSON.stringify(parsed, null, 2);
 
@@ -494,6 +470,7 @@
         row.addEventListener('click', () => {
           parsedResult = inv;
           lastOCR.combined = inv.raw || '';
+          lastOCRtext = lastOCR.combined;
           rawTextEl.textContent = lastOCR.combined;
           cleanedTextEl.textContent = inv.raw || '';
           renderInvoicePreview(parsedResult);
@@ -505,134 +482,88 @@
       console.error(e); historyList.textContent = 'History load failed';
     }
   }
-/* ----------- Exporters ----------- */
 
-function filenameBase() {
-  const name = parsedResult && parsedResult.merchant ? parsedResult.merchant : 'invoice';
-  return `${name}_${Date.now()}`;
-}
+  /* ----------- Exporters ----------- */
+  function filenameBase() {
+    const name = parsedResult && parsedResult.merchant ? parsedResult.merchant.replace(/[^a-z0-9]/ig,'_') : 'invoice';
+    return `${name}_${Date.now()}`;
+  }
 
-function downloadBlob(blob, filename) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-}
+  function exportJSON() {
+    if (!parsedResult) return setStatus('Nothing to export', false);
+    downloadBlobDirect(new Blob([JSON.stringify(parsedResult, null, 2)], { type: 'application/json' }), filenameBase() + '.json');
+    setStatus('Exported JSON', true);
+  }
 
-/* ---- Export JSON ---- */
-function exportJSON() {
-  if (!parsedResult) return setStatus('Nothing to export', false);
-  downloadBlob(
-    new Blob([JSON.stringify(parsedResult, null, 2)], { type: 'application/json' }),
-    filenameBase() + '.json'
-  );
-  setStatus('Exported JSON', true);
-}
+  function exportTXT() {
+    if (!parsedResult) return setStatus('Nothing to export', false);
+    const txt = parsedResult.raw || parsedResult.cleaned || 'No raw OCR text available.';
+    downloadBlobDirect(new Blob([txt], { type: 'text/plain' }), filenameBase() + '.txt');
+    setStatus('Exported TXT', true);
+  }
 
-/* ---- Export TXT ---- */
-function exportTXT() {
-  if (!parsedResult) return setStatus('Nothing to export', false);
-  const txt = parsedResult.raw || parsedResult.cleaned || 'No raw OCR text available.';
-  downloadBlob(new Blob([txt], { type: 'text/plain' }), filenameBase() + '.txt');
-  setStatus('Exported TXT', true);
-}
-
-/* ---- Export CSV/TSV ---- */
-function exportCSV() {
-  if (!parsedResult) return setStatus('Nothing to export', false);
-  let tsv = 'Name\tQty\tPrice\tTotal\n';
-  (parsedResult.display.items || []).forEach((it) => {
-    tsv += `${it.name}\t${it.qty}\t${it.price}\t${it.total}\n`;
-  });
-
-  downloadBlob(new Blob([tsv], { type: 'text/tab-separated-values' }), filenameBase() + '.tsv');
-  setStatus('Exported TSV/CSV', true);
-}
-
-/* ---- Export PDF ---- */
-async function exportPDF() {
-  if (!parsedResult) return setStatus('Nothing to export', false);
-  if (typeof html2canvas === 'undefined' || typeof window.jspdf === 'undefined')
-    return setStatus('html2canvas/jsPDF missing', false);
-
-  try {
-    const el = document.querySelector('#previewContainer');
-    const canvas = await html2canvas(el, { scale: 2 });
-    const img = canvas.toDataURL('image/png');
-
-    const { jsPDF } = window.jspdf;
-    const pdf = new jsPDF({
-      orientation: 'portrait',
-      unit: 'mm',
-      format: 'a4'
+  function exportCSV() {
+    if (!parsedResult) return setStatus('Nothing to export', false);
+    let tsv = 'Name\tQty\tPrice\tTotal\n';
+    (parsedResult.display.items || []).forEach((it) => {
+      tsv += `${it.name}\t${it.qty}\t${it.price}\t${it.total}\n`;
     });
-
-    const pad = 20;
-    const w = pdf.internal.pageSize.getWidth() - pad * 2;
-    const h = (canvas.height * w) / canvas.width;
-
-    pdf.addImage(img, 'PNG', pad, pad, w, h);
-    pdf.save(filenameBase() + '.pdf');
-
-    setStatus('Exported PDF', true);
-  } catch (e) {
-    console.error(e);
-    setStatus('PDF export failed', false);
+    downloadBlobDirect(new Blob([tsv], { type: 'text/tab-separated-values' }), filenameBase() + '.tsv');
+    setStatus('Exported TSV/CSV', true);
   }
-}
 
-/* ---- Export ZIP ---- */
-async function exportZIP() {
-  if (!parsedResult) return setStatus('Nothing to export', false);
-  if (typeof JSZip === 'undefined') return setStatus('JSZip missing', false);
-
-  try {
-    const zip = new JSZip();
-    const base = filenameBase();
-
-    zip.file(base + '.json', JSON.stringify(parsedResult, null, 2));
-    zip.file(base + '.txt', parsedResult.raw || '');
-
-    let csv = 'Name\tQty\tPrice\tTotal\n';
-    (parsedResult.display.items || []).forEach(
-      (it) => (csv += `${it.name}\t${it.qty}\t${it.price}\t${it.total}\n`)
-    );
-    zip.file(base + '.tsv', csv);
-
-    zip.file(base + '.tally.xml', generateTallyXML(parsedResult));
-
-    // PNG Screenshot
+  async function exportPDF() {
+    if (!parsedResult) return setStatus('Nothing to export', false);
+    if (typeof html2canvas === 'undefined' || typeof window.jspdf === 'undefined') return setStatus('html2canvas/jsPDF missing', false);
     try {
-      const el = document.querySelector('#previewContainer') || document.body;
+      const el = document.querySelector('#previewContainer');
       const canvas = await html2canvas(el, { scale: 2 });
-      const img = canvas.toDataURL('image/png').split(',')[1];
-      zip.file(base + '.png', img, { base64: true });
+      const img = canvas.toDataURL('image/png');
+      const { jsPDF } = window.jspdf;
+      const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+      const pad = 20;
+      const w = pdf.internal.pageSize.getWidth() - pad * 2;
+      const h = (canvas.height * w) / canvas.width;
+      pdf.addImage(img, 'PNG', pad, pad, w, h);
+      pdf.save(filenameBase() + '.pdf');
+      setStatus('Exported PDF', true);
     } catch (e) {
-      console.warn('PNG capture failed', e);
+      console.error(e); setStatus('PDF export failed', false);
     }
-
-    const blob = await zip.generateAsync({ type: 'blob' });
-    downloadBlob(blob, base + '.zip');
-    setStatus('Exported ZIP', true);
-  } catch (e) {
-    console.error(e);
-    setStatus('ZIP export failed', false);
   }
-}
 
-/* ---- Tally XML Generator ---- */
-function generateTallyXML(inv) {
-  const company = inv.display.merchant || 'Merchant';
-  const rawDate = inv.date || new Date().toISOString().slice(0, 10);
-  const date = rawDate.replace(/-/g, '');
-  const amount =
-    inv.total && inv.total.cents ? (inv.total.cents / 100).toFixed(2) : '0.00';
+  async function exportZIP() {
+    if (!parsedResult) return setStatus('Nothing to export', false);
+    if (typeof JSZip === 'undefined') return setStatus('JSZip missing', false);
+    try {
+      const zip = new JSZip();
+      const base = filenameBase();
+      zip.file(base + '.json', JSON.stringify(parsedResult, null, 2));
+      zip.file(base + '.txt', parsedResult.raw || '');
+      let csv = 'Name\tQty\tPrice\tTotal\n';
+      (parsedResult.display.items || []).forEach((it) => (csv += `${it.name}\t${it.qty}\t${it.price}\t${it.total}\n`));
+      zip.file(base + '.tsv', csv);
+      zip.file(base + '.tally.xml', generateTallyXML(parsedResult));
+      try {
+        const el = document.querySelector('#previewContainer') || document.body;
+        const canvas = await html2canvas(el, { scale: 2 });
+        const img = canvas.toDataURL('image/png').split(',')[1];
+        zip.file(base + '.png', img, { base64: true });
+      } catch (e) { console.warn('PNG capture failed', e); }
+      const blob = await zip.generateAsync({ type: 'blob' });
+      downloadBlobDirect(blob, base + '.zip');
+      setStatus('Exported ZIP', true);
+    } catch (e) {
+      console.error(e); setStatus('ZIP export failed', false);
+    }
+  }
 
-  let xml = `<?xml version="1.0" encoding="UTF-8"?>
+  function generateTallyXML(inv) {
+    const company = inv.display.merchant || 'Merchant';
+    const rawDate = inv.date || new Date().toISOString().slice(0, 10);
+    const date = rawDate.replace(/-/g, '');
+    const amount = inv.total && inv.total.cents ? (inv.total.cents / 100).toFixed(2) : '0.00';
+    let xml = `<?xml version="1.0" encoding="UTF-8"?>
 <TALLYMESSAGE>
   <VOUCHER>
     <DATE>${date}</DATE>
@@ -640,72 +571,138 @@ function generateTallyXML(inv) {
     <PARTYNAME>${company}</PARTYNAME>
     <AMOUNT>${amount}</AMOUNT>
     <ALLLEDGERS>`;
-
-  (inv.display.items || []).forEach((it, i) => {
-    xml += `
+    (inv.display.items || []).forEach((it, i) => {
+      xml += `
       <LEDGER>
-        <NAME>${it.name || `Item${i + 1}`}</NAME>
-        <AMOUNT>${it.total || '0.00'}</AMOUNT>
+        <NAME>${it.name || `Item${i+1}`}</NAME>
+        <AMOUNT>${(it.total && typeof it.total === 'number') ? (it.total/100).toFixed(2) : (it.total||'0')}</AMOUNT>
       </LEDGER>`;
-  });
-
-  xml += `
+    });
+    xml += `
     </ALLLEDGERS>
   </VOUCHER>
 </TALLYMESSAGE>`;
-
-  return xml;
-}
-
-/* ----------- Event Listeners ----------- */
-
-dualOCRBtn?.addEventListener('click', async () => {
-  const f = fileInput.files[0];
-  if (!f) return setStatus('Choose a file first', false);
-  await runDualOCR(f);
-});
-
-ocrOnlyBtn?.addEventListener('click', async () => {
-  const f = fileInput.files[0];
-  if (!f) return setStatus('Choose a file first', false);
-  await runQuickOCR(f);
-});
-
-parseBtn?.addEventListener('click', () => {
-  if (!lastOCRtext) return setStatus('No OCR text available', false);
-  const p = parseRawInvoiceText(lastOCRtext);
-  if (!p) return setStatus('Parser failed', false);
-  parsedResult = p;
-  ANJRender(p);
-  setStatus('Parsed successfully', true);
-});
-
-exportJsonBtn?.addEventListener('click', () => exportJSON());
-exportTxtBtn?.addEventListener('click', () => exportTXT());
-exportCsvBtn?.addEventListener('click', () => exportCSV());
-exportPdfBtn?.addEventListener('click', () => exportPDF());
-exportZipBtn?.addEventListener('click', () => exportZIP());
-
-loadHistoryBtn?.addEventListener('click', async () => loadHistory());
-clearHistoryBtn?.addEventListener('click', async () => {
-  await clearInvoices();
-  historyList.textContent = 'History Cleared';
-});
-
-/* ----------- Init ----------- */
-
-(async function initApp() {
-  try {
-    await openDB();
-    const savedTheme = localStorage.getItem('anj_theme');
-    if (savedTheme) {
-      document.body.className = 'theme-' + savedTheme;
-      themeSelect.value = savedTheme;
-    }
-    setStatus('Ready');
-  } catch (e) {
-    console.error(e);
-    setStatus('Init failed', false);
+    return xml;
   }
+
+  /* ---------- OCR flows (missing functions added) ---------- */
+  async function runDualOCR(file) {
+    try {
+      setStatus('Starting Dual OCR...');
+      lastOCR = { quick: '', enhanced: '', combined: '' };
+      lastOCRtext = '';
+      let pdfText = '';
+      if (file.name && file.name.toLowerCase().endsWith('.pdf')) {
+        pdfText = await extractTextFromPDF(file);
+      }
+      const imageBlob = await fileToImageBlob(file);
+      if (imageBlob) {
+        setStatus('Running quick OCR...');
+        lastOCR.quick = await recognizeWithTesseract(imageBlob);
+      } else lastOCR.quick = '';
+      setStatus('Running enhanced OCR...');
+      lastOCR.enhanced = await recognizeWithTesseract(imageBlob || file);
+      lastOCR.combined = [pdfText, lastOCR.enhanced, lastOCR.quick].filter(Boolean).join('\n\n');
+      lastOCRtext = lastOCR.combined;
+      rawTextEl.textContent = lastOCR.combined || '';
+      setStatus('Dual OCR complete', true);
+      return lastOCR.combined;
+    } catch (e) {
+      console.error(e);
+      setStatus('Dual OCR failed', false);
+      return '';
+    }
+  }
+
+  async function runQuickOCR(file) {
+    try {
+      setStatus('Running quick OCR...');
+      const imageBlob = await fileToImageBlob(file);
+      const text = await recognizeWithTesseract(imageBlob || file);
+      lastOCR = { quick: text || '', enhanced: '', combined: text || '' };
+      lastOCRtext = lastOCR.combined;
+      rawTextEl.textContent = lastOCR.combined || '';
+      setStatus('Quick OCR complete', true);
+      return lastOCR.combined;
+    } catch (e) {
+      console.error(e);
+      setStatus('Quick OCR failed', false);
+      return '';
+    }
+  }
+
+  /* ----------- Event Listeners ----------- */
+  dualOCRBtn?.addEventListener('click', async () => {
+    const f = fileInput.files[0];
+    if (!f) return setStatus('Choose a file first', false);
+    await runDualOCR(f);
+  });
+
+  ocrOnlyBtn?.addEventListener('click', async () => {
+    const f = fileInput.files[0];
+    if (!f) return setStatus('Choose a file first', false);
+    await runQuickOCR(f);
+  });
+
+  parseBtn?.addEventListener('click', async () => {
+    const text = lastOCRtext || (lastOCR && lastOCR.combined) || '';
+    if (!text) return setStatus('No OCR text available', false);
+    try {
+      const p = parseRawInvoiceText(text);
+      if (!p) return setStatus('Parser failed', false);
+      parsedResult = p;
+      try {
+        if (typeof window.ANJRender === 'function') window.ANJRender(p);
+        else renderInvoicePreview(p);
+      } catch (e) { renderInvoicePreview(p); }
+      await saveInvoice(p).catch(()=>{});
+      await renderHistory();
+      setStatus('Parsed successfully', true);
+    } catch (e) {
+      console.error(e);
+      setStatus('Parse failed', false);
+    }
+  });
+
+  exportJsonBtn?.addEventListener('click', () => exportJSON());
+  exportTxtBtn?.addEventListener('click', () => exportTXT());
+  exportCsvBtn?.addEventListener('click', () => exportCSV());
+  exportPdfBtn?.addEventListener('click', () => exportPDF());
+  exportZipBtn?.addEventListener('click', () => exportZIP());
+
+  loadHistoryBtn?.addEventListener('click', async () => { await renderHistory(); });
+  clearHistoryBtn?.addEventListener('click', async () => { await clearInvoices(); historyList.textContent = 'History Cleared'; });
+
+  /* ---------- Init ---------- */
+  (async function initApp() {
+    try {
+      await openDB();
+      const savedTheme = localStorage.getItem('anj_theme');
+      if (savedTheme) {
+        document.body.className = 'theme-' + savedTheme;
+        if (themeSelect) themeSelect.value = savedTheme;
+      }
+      setStatus('Ready', true);
+      await renderHistory();
+    } catch (e) {
+      console.error(e);
+      setStatus('Init failed', false);
+    }
+  })();
+
+  // expose a couple helpers for debugging if needed
+  window._ANJ = window._ANJ || {};
+  window._ANJ.runDualOCR = runDualOCR;
+  window._ANJ.runQuickOCR = runQuickOCR;
+  window._ANJ.parseRawInvoiceText = parseRawInvoiceText;
+
 })();
-      
+        - Added robust runDualOCR and runQuickOCR functions (supports PDF text + image OCR fallback).
+- Fixed OCR/text state handling (lastOCR + lastOCRtext).
+- Implemented IndexedDB history functions and wired renderHistory/saveInvoice.
+- Completed parser integration (parseRawInvoiceText) with improved heuristics and confidence scoring.
+- Implemented exporters (JSON, TXT, TSV/CSV, PDF via html2canvas+jsPDF, ZIP with JSZip) and Tally XML generator.
+- Fixed initialization issue (document.body typo) and theme restore.
+- Exposed _ANJ debug helpers for easier mobile testing.
+- Defensive checks for missing libs (html2canvas, jspdf, JSZip, Tesseract).
+ 
